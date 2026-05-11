@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from click.testing import CliRunner
+from pytest import MonkeyPatch
 
 from bulwark_mcp import __version__
 from bulwark_mcp.cli import main
@@ -44,9 +46,9 @@ def _settings(tmp_path: Path) -> SimpleNamespace:
 
 
 def test_detect_ollama_unreachable_prints_friendly_error_and_exits_2(
-    monkeypatch, tmp_path: Path
+    monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
-    async def _fake_run_detect(*args, **kwargs):
+    async def _fake_run_detect(*args: object, **kwargs: object) -> Any:
         return SimpleNamespace(
             verdict="PASS",
             note="error:ConnectError",
@@ -72,9 +74,9 @@ def test_detect_ollama_unreachable_prints_friendly_error_and_exits_2(
 
 
 def test_detect_no_llm_flag_does_not_trigger_ollama_unreachable_handling(
-    monkeypatch, tmp_path: Path
+    monkeypatch: MonkeyPatch, tmp_path: Path
 ) -> None:
-    async def _fake_run_detect(*args, **kwargs):
+    async def _fake_run_detect(*args: object, **kwargs: object) -> Any:
         return SimpleNamespace(
             verdict="PASS",
             note="error:ConnectError",
