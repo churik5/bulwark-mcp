@@ -259,6 +259,9 @@ def cmd_detect(
     except FileNotFoundError as exc:
         _console.print(f"[red]error:[/red] {exc}")
         sys.exit(2)
+    if _is_ollama_unreachable(result, no_llm=no_llm, settings=settings):
+        _print_ollama_unreachable(settings)
+        sys.exit(2)
     _print_detection_result(result)
     sys.exit(0 if result.verdict == "PASS" else 1)
 
@@ -345,6 +348,22 @@ def _print_detection_result(result: Any) -> None:
         out.print(f"policy: [yellow]{result.matched_policy}[/yellow] → {result.action}")
     else:
         out.print(f"policy: [dim]no match[/dim] → {result.action}")
+
+
+def _is_ollama_unreachable(result: Any, *, no_llm: bool, settings: Settings) -> bool:
+    if no_llm or not settings.detector.llm_enabled:
+        return False
+    note = getattr(result, "note", None)
+    return isinstance(note, str) and note.startswith("error:ConnectError")
+
+
+def _print_ollama_unreachable(settings: Settings) -> None:
+    _console.print(f"Error: Could not reach Ollama at {settings.detector.ollama_url}.")
+    _console.print("Suggestions:")
+    _console.print("• Start Ollama: ollama serve")
+    _console.print(f"• Or pull the model: ollama pull {settings.detector.ollama_model}")
+    _console.print('• Or run rules-only: bulwark detect "..." --no-llm')
+    _console.print("• Or run bulwark doctor to diagnose your setup.")
 
 
 def _setup_logging(verbose: int) -> None:
