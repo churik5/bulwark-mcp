@@ -4,7 +4,7 @@ _English_ · [Русский](README.ru.md)
 
 [![CI](https://github.com/churik5/bulwark-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/churik5/bulwark-mcp/actions/workflows/ci.yml) [![Python: 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/) [![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 
-A local proxy that catches prompt-injection in tool results before your agent reads them. Self-hosted, no telemetry by default, ~200 ms p95 with the LLM classifier on.
+A local proxy that catches indirect prompt-injection in tool results before your agent reads them. Self-hosted, no telemetry by default, ~200 ms p95 with the LLM classifier on. Deliberately narrow: a dedicated injection detector, not a credential or governance gateway.
 
 ![bulwark-mcp blocking a real prompt injection attack in real time](docs/demo.gif)
 
