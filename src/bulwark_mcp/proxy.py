@@ -110,6 +110,11 @@ async def run_proxy(
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=sys.stderr.fileno(),
+            # Give child.stdout's StreamReader the SAME line limit as the
+            # client reader. Without this it keeps asyncio's 64 KiB default,
+            # so any server response over 64 KiB on one line overruns and
+            # crashes the s2c pump — yet large tool results are routine.
+            limit=line_limit,
         )
         if child.stdin is None or child.stdout is None:
             raise RuntimeError("subprocess pipes were not created — check argv")
@@ -324,8 +329,14 @@ async def _pump(
         while not stop_event.is_set():
             try:
                 line = await src.readline()
-            except asyncio.LimitOverrunError as exc:
-                consumed = await _drain_oversized(src, exc.consumed)
+            except (asyncio.LimitOverrunError, ValueError) as exc:
+                # Two readers signal an oversized line two ways: the blocking
+                # reader raises LimitOverrunError, the async StreamReader
+                # re-raises asyncio's overflow as a plain ValueError. Treat
+                # both as the same "oversized frame" case instead of letting
+                # the ValueError escape and kill the pump. The try wraps ONLY
+                # readline, so no unrelated ValueError is swallowed here.
+                consumed = await _drain_oversized(src, _consumed_from_overflow(exc))
                 _record_raw(
                     buffer,
                     session_id=session_id,
@@ -691,12 +702,36 @@ async def _safe_write(
         return await writer.write_line(data)
 
 
-async def _drain_oversized(src: _LineReader, consumed: int) -> bytes:
-    """Best-effort drain of an oversized frame.
+def _consumed_from_overflow(exc: Exception) -> int:
+    """Bytes already consumed when a reader reports an oversized line.
 
-    Only the asyncio reader exposes ``readexactly``; the blocking fallback
-    already returned the partial bytes inside ``LimitOverrunError`` is not
-    reachable on that path. We probe via ``getattr`` and degrade gracefully.
+    :class:`asyncio.LimitOverrunError` (raised by :class:`_BlockingReader`)
+    carries a ``.consumed`` count. The async reader signals the same overflow
+    as a plain :class:`ValueError`, which has no such attribute, so we report
+    ``0`` — asyncio's ``StreamReader.readline`` has already discarded the
+    overflow from its own buffer, leaving nothing for :func:`_drain_oversized`.
+    """
+    return int(getattr(exc, "consumed", 0))
+
+
+async def _drain_oversized(src: _LineReader, consumed: int) -> bytes:
+    """Drain leftover bytes after an oversized-line error — a no-op in practice.
+
+    The two readers signal an oversized line differently, and BOTH leave
+    nothing for this function to drain:
+
+    - :class:`_AsyncStreamReader` surfaces the overflow as a ``ValueError``;
+      asyncio's ``StreamReader.readline`` discards/advances its own buffer
+      before raising, so the pump passes ``consumed == 0`` and
+      ``_readexactly(0)`` returns empty bytes.
+    - :class:`_BlockingReader` drains its own overflow synchronously in the
+      worker thread *before* raising :class:`asyncio.LimitOverrunError`,
+      leaving the stream positioned at the next frame. It exposes no
+      ``_readexactly``, so there is nothing left to drain either.
+
+    We probe for ``_readexactly`` via ``getattr`` and degrade gracefully; the
+    branch stays in place for any reader that raises with overflow still
+    buffered. Either way the single :func:`_pump` handler works for both.
     """
     readexactly = getattr(src, "_readexactly", None)
     if readexactly is not None:
@@ -853,16 +888,113 @@ class _AsyncStreamWriter:
 
 
 class _BlockingReader:
-    """Fallback: blocking line reader on a worker thread."""
+    """Fallback: blocking line reader on a worker thread.
 
-    def __init__(self, fileobj: IO[bytes]) -> None:
+    Plain ``io.BufferedReader.readline()`` is *unbounded* — an oversized
+    frame would be slurped into memory in one shot, an OOM / DoS vector. We
+    bound every read at ``limit`` bytes so this fallback honours the SAME
+    contract :class:`_AsyncStreamReader` already enforces: a line over the
+    limit is drained (read and discarded up to the next ``\n`` or EOF) and
+    surfaced as an :class:`asyncio.LimitOverrunError`. (Note: the asyncio
+    reader signals the same overflow as a ``ValueError`` instead; the
+    handler in :func:`_pump` catches both exception types.) The drain runs
+    synchronously inside the worker thread (natural for a blocking reader),
+    leaving the stream positioned at the start of the next frame.
+
+    A closed or invalid underlying stream is reported as a clean EOF
+    (``b""``); this reader never lets a bare ``ValueError`` escape, so
+    :func:`_pump`'s ``ValueError`` branch unambiguously means an async-reader
+    overflow and a closed blocking stdin ends the pump instead of spinning.
+
+    Boundary semantics (off-by-one): ``readline(limit)`` reads at most
+    ``limit`` bytes, stopping early at the first ``\\n``. A line therefore
+    *fits* when its newline-terminated form is at most ``limit`` bytes (i.e.
+    at most ``limit - 1`` content bytes); the trailing ``\\n`` counts toward
+    the budget. A line whose content reaches ``limit`` bytes before any
+    ``\\n`` is oversized. The lone exception is a final, unterminated line
+    *under* the limit (EOF before both the limit and a ``\\n``): like
+    :meth:`asyncio.StreamReader.readline`, we return that partial tail intact.
+    """
+
+    # Drain the overflow in bounded steps so we never hold more than one
+    # chunk past the limit in memory while discarding an oversized line.
+    _DRAIN_CHUNK = 64 * 1024
+
+    def __init__(self, fileobj: IO[bytes], *, limit: int) -> None:
         self._fileobj = fileobj
+        self._limit = limit
         self._closed = False
 
     async def readline(self) -> bytes:
         if self._closed:
             return b""
-        return await asyncio.to_thread(self._fileobj.readline)
+        return await asyncio.to_thread(self._readline_bounded)
+
+    def _readline_bounded(self) -> bytes:
+        """Read one line capped at ``self._limit`` bytes (runs in a worker thread).
+
+        ``io.BufferedReader.readline(size)`` stops at the first ``\\n`` OR
+        after ``size`` bytes, whichever comes first, so a single
+        ``readline(limit)`` tells us which happened:
+
+        - empty result → clean EOF, return ``b""``;
+        - underlying file closed under us (a ``ValueError`` surfaced as
+          ``None`` by :meth:`_read_or_none`) → also a clean end-of-stream,
+          return ``b""``;
+        - ends in ``\\n`` → the whole line fit, return it (trailing ``\\n``
+          included, matching readline semantics);
+        - shorter than ``limit`` without a ``\\n`` → EOF reached before the
+          limit, a final unterminated tail that still fits — return it;
+        - exactly ``limit`` bytes without a ``\\n`` → oversized. Drain the
+          rest of the line (next ``\\n`` or EOF) in bounded chunks, then raise
+          :class:`asyncio.LimitOverrunError` so the stream is left at the
+          start of the next frame.
+        """
+        chunk = self._read_or_none(self._limit)
+        if not chunk:
+            return b""  # clean stream end: EOF, or stdin closed under us
+        if chunk.endswith(b"\n"):
+            return chunk  # complete line within the limit
+        if len(chunk) < self._limit:
+            # EOF before both the limit and a newline: a final unterminated
+            # line that fits. Return it as readline() does at EOF.
+            return chunk
+        # Limit hit with no newline → oversized. Drain and discard the rest
+        # of the line synchronously, then raise.
+        consumed = len(chunk)
+        while True:
+            extra = self._read_or_none(self._DRAIN_CHUNK)
+            if extra is None:
+                # Stream closed mid-drain: nothing left to discard and no
+                # point raising into a dead stream — report a clean EOF.
+                return b""
+            if not extra:
+                break  # genuine EOF before the oversized line terminated
+            consumed += len(extra)
+            if extra.endswith(b"\n"):
+                break  # reached the end of the oversized line
+        raise asyncio.LimitOverrunError(
+            f"line exceeded {self._limit}-byte limit before a newline", consumed
+        )
+
+    def _read_or_none(self, size: int) -> bytes | None:
+        """``self._fileobj.readline(size)``, or ``None`` if the file is closed.
+
+        ``io.BufferedReader.readline`` raises ``ValueError`` ("readline of
+        closed file") if stdin is closed under us mid-run. We surface that as
+        ``None`` so the caller treats a closed stream as a clean end-of-stream
+        rather than letting the bare ``ValueError`` escape — which would land
+        in :func:`_pump`'s oversized branch and busy-loop. Over-limit lines on
+        this path are signalled by :class:`asyncio.LimitOverrunError`, never by
+        ``ValueError`` (we cap the read size ourselves), so swallowing
+        ``ValueError`` here cannot hide a real overflow. We do NOT match on the
+        exception message: any ``ValueError`` from the file read means the
+        stream is unusable and is treated as end-of-stream.
+        """
+        try:
+            return self._fileobj.readline(size)
+        except ValueError:
+            return None
 
     def close(self) -> None:
         self._closed = True
@@ -915,7 +1047,7 @@ async def _open_client_reader(limit: int) -> _LineReader:
         return _AsyncStreamReader(reader)
     except (ValueError, OSError, NotImplementedError) as exc:
         logger.debug("falling back to blocking stdin reader: %r", exc)
-        return _BlockingReader(sys.stdin.buffer)
+        return _BlockingReader(sys.stdin.buffer, limit=limit)
 
 
 async def _open_client_writer() -> _LineWriter:
