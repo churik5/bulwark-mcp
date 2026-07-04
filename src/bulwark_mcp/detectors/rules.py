@@ -273,7 +273,7 @@ def _extract_arguments_text(frame_text: str) -> str:
     """
     try:
         payload = json.loads(frame_text)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return ""
     if not isinstance(payload, dict) or payload.get("method") != "tools/call":
         return ""
@@ -284,7 +284,14 @@ def _extract_arguments_text(frame_text: str) -> str:
     if arguments is None:
         return ""
     chunks: list[str] = []
-    _collect_array_strings(arguments, chunks)
+    try:
+        _collect_array_strings(arguments, chunks)
+    except RecursionError:
+        # Arguments nested past the interpreter's recursion limit overflow the
+        # recursive walk. detect() has no guard and Inspector.inspect() calls
+        # it outside its try, so an escaping RecursionError would crash the c2s
+        # pump. Degrade to "no argument text extracted" instead of raising.
+        return ""
     return " ".join(chunks)
 
 

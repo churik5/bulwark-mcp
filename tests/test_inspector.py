@@ -144,6 +144,32 @@ class TestInspectorWithoutClassifier:
         assert "error" in replacement
         assert replacement["error"]["code"] == -32099
 
+    async def test_deeply_nested_c2s_arguments_do_not_raise(
+        self, builtin_engine: RulesEngine, tmp_path: Path
+    ) -> None:
+        # Regression: a c2s tools/call whose params.arguments is nested past the
+        # recursion limit used to raise RecursionError out of the rules walk and
+        # crash the pump. inspect() must uphold its "never raises out" contract.
+        async with Storage(tmp_path / "log.db") as _:
+            insp = Inspector(
+                rules=builtin_engine,
+                classifier=None,
+                policy=_default_policy(),
+            )
+            raw = (
+                '{"jsonrpc":"2.0","id":9,"method":"tools/call",'
+                '"params":{"name":"x","arguments":' + "[" * 2000 + "]" * 2000 + "}}"
+            )
+            parsed, _ = parse_frame(raw)
+            result = await insp.inspect(
+                raw=raw,
+                parsed=parsed,
+                direction="client_to_server",
+                method_hint="tools/call",
+            )
+        assert result.action == "allow"
+        assert result.verdict == "PASS"
+
 
 class TestInspectorWithClassifier:
     async def test_classifier_warn_path(self, builtin_engine: RulesEngine, tmp_path: Path) -> None:

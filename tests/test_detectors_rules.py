@@ -568,3 +568,24 @@ class TestArgumentNormalisation:
         frame = self._frame("exec", {"argv": ["rm", "-rf", "/"]})
         result = builtin_engine.detect(frame, direction="server_to_client")
         assert not result.is_hit
+
+
+class TestDeepNestingDoesNotCrash:
+    """Regression: a pathologically nested c2s frame must not crash the detector.
+
+    ``_collect_array_strings`` walks ``params.arguments`` recursively. Arguments
+    nested past the interpreter's recursion limit used to raise RecursionError
+    out of ``detect()`` — which its caller ``Inspector.inspect`` does not guard —
+    crashing the c2s pump. It must now degrade to "no argument text extracted".
+    """
+
+    def test_deeply_nested_arguments_do_not_raise(self, builtin_engine: RulesEngine) -> None:
+        # ~2000-deep arguments: shallow enough for json.loads to succeed, deep
+        # enough to overflow the recursive argv walk. detect() must return a
+        # normal (empty) result instead of propagating RecursionError.
+        frame = (
+            '{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+            '"params":{"name":"x","arguments":' + "[" * 2000 + "]" * 2000 + "}}"
+        )
+        result = builtin_engine.detect(frame, direction="client_to_server")
+        assert not result.is_hit

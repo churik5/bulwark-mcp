@@ -70,7 +70,12 @@ def parse_frame(line: str) -> tuple[ParsedMessage | None, str]:
         return None, "empty"
     try:
         payload = json.loads(line)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
+        # A deeply nested array overflows json.loads with a RecursionError,
+        # which is NOT a JSONDecodeError; without catching it here the error
+        # would escape into the pump and crash it. Treat it like any other
+        # malformed frame. Keep the handler trivial — the stack is near its
+        # limit at this point.
         return None, "parse_error"
 
     if isinstance(payload, list):
@@ -90,7 +95,12 @@ def split_batch(line: str) -> list[str]:
     """
     try:
         payload = json.loads(line.strip() or "null")
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError):
+        # A deeply nested array overflows json.loads with a RecursionError
+        # (not a JSONDecodeError); treat it as a non-batch frame so the caller
+        # forwards/logs it like any other unparseable line instead of letting
+        # the error crash the pump. Nothing heavy here — the stack is near its
+        # limit.
         return [line]
     if isinstance(payload, list):
         return [json.dumps(item, separators=(",", ":")) for item in payload]

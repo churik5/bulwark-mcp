@@ -85,6 +85,15 @@ class TestParseFrame:
         assert isinstance(parsed, MCPResponse)
         assert parsed.id is None
 
+    def test_deeply_nested_json_is_parse_error_not_recursion_crash(self) -> None:
+        # A deeply nested array (~40k, well under the 8 MiB line limit) overflows
+        # json.loads with a RecursionError, which is NOT a JSONDecodeError. It
+        # must degrade to a parse error rather than escaping and crashing the pump.
+        line = "[" * 40000 + "]" * 40000
+        parsed, kind = parse_frame(line)
+        assert parsed is None
+        assert kind == "parse_error"
+
 
 class TestSplitBatch:
     def test_splits_a_two_element_batch(self) -> None:
@@ -100,6 +109,13 @@ class TestSplitBatch:
 
     def test_returns_singleton_for_invalid_json(self) -> None:
         line = "garbage"
+        assert split_batch(line) == [line]
+
+    def test_deeply_nested_json_is_singleton_not_recursion_crash(self) -> None:
+        # json.loads raises RecursionError (not JSONDecodeError) on a deeply
+        # nested array; split_batch must treat it as a non-batch frame instead
+        # of letting the error escape and crash the pump.
+        line = "[" * 40000 + "]" * 40000
         assert split_batch(line) == [line]
 
 
