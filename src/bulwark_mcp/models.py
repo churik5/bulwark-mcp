@@ -103,7 +103,14 @@ def split_batch(line: str) -> list[str]:
         # limit.
         return [line]
     if isinstance(payload, list):
-        return [json.dumps(item, separators=(",", ":")) for item in payload]
+        # ensure_ascii=False keeps real (non-ASCII) characters in each member.
+        # Without it json.dumps escapes them to \uXXXX, and the detector's
+        # unicode passes (homoglyph fold, zero-width / RTL / bidi stripping) —
+        # which operate on real characters — never fire, so any unicode attack
+        # bypasses detection simply by being wrapped in a batch. The members
+        # stay valid UTF-8 JSON either way, so downstream (forward-verbatim /
+        # ",".join reassembly) is unaffected.
+        return [json.dumps(item, separators=(",", ":"), ensure_ascii=False) for item in payload]
     return [line]
 
 
