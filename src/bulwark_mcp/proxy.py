@@ -44,7 +44,7 @@ from .detectors.rules import RulesEngine
 from .health import HealthState
 from .health import serve as serve_health
 from .inspector import Inspector
-from .models import EventRecord, JsonRpcId, MCPRequest, parse_frame, split_batch
+from .models import EventRecord, MCPRequest, parse_frame, split_batch
 from .policy import Policy, default_policy
 from .storage import EventBuffer, Storage
 from .telemetry import TelemetryClient
@@ -388,20 +388,30 @@ async def _pump(
                 ]
                 if blocked_hits:
                     trace_id = _capability_trace_id()
+                    # A blocked call is NEVER forwarded to the server. The reply
+                    # to the client is best-effort per JSON-RPC: a batch, and any
+                    # id-bearing single call, get an error reply echoing the id;
+                    # a single blocked notification (no id) gets no reply at all
+                    # — but is still not forwarded.
+                    reply_text: str | None
                     if is_batch:
-                        replacement_text = (
+                        reply_text = (
                             "[" + ",".join(_build_capability_batch(members, cap_hits)) + "]"
                         )
                     else:
                         first_hit = blocked_hits[0][1]
-                        replacement_text = _capability_error_reply(
-                            request_id=first_hit.parsed.id, full_name=first_hit.full_name
-                        )
-                    replacement_bytes = (replacement_text + "\n").encode("utf-8")
-                    if not await _safe_write(
-                        reverse_dst, replacement_bytes, lock=client_write_lock
-                    ):
-                        return
+                        if first_hit.reply_expected:
+                            reply_text = _capability_error_reply(
+                                request_id=first_hit.reply_id, full_name=first_hit.full_name
+                            )
+                        else:
+                            reply_text = None
+                    if reply_text is not None:
+                        replacement_bytes = (reply_text + "\n").encode("utf-8")
+                        if not await _safe_write(
+                            reverse_dst, replacement_bytes, lock=client_write_lock
+                        ):
+                            return
                     for member, hit in zip(members, cap_hits, strict=True):
                         if hit is not None and hit.blocked:
                             _record_capability_block(
@@ -576,9 +586,18 @@ def _compose_batch_aborted_reply(member: str) -> str | None:
 
 @dataclass(frozen=True)
 class _CapHit:
-    """One c2s ``tools/call`` member resolved against the capability filter."""
+    """One c2s ``tools/call`` member resolved against the capability filter.
 
-    parsed: MCPRequest
+    ``reply_id`` is the raw JSON ``id`` exactly as it arrived — an int, a
+    string, or (for the malformed-id bypass) a float like ``1.5`` — or ``None``
+    when the frame carries no ``id`` at all. ``reply_expected`` records whether
+    an ``id`` key was present: ``True`` → a block answers the client with a
+    ``-32603`` reply echoing ``reply_id``; ``False`` (a notification) → a block
+    sends no reply (JSON-RPC forbids one) but still never forwards.
+    """
+
+    reply_id: Any
+    reply_expected: bool
     full_name: str
     args_truncated: str
     blocked: bool
@@ -587,18 +606,34 @@ class _CapHit:
 def _scan_capability(members: list[str], capability: CapabilityFilter) -> list[_CapHit | None]:
     """Per-member capability decisions for a c2s frame.
 
-    Only ``tools/call`` requests carry a tool name; every other shape
-    (notifications, ``tools/list``, ``initialize``, parse errors) yields
-    ``None`` and is left for the inspector / normal forwarding. A
-    ``tools/call`` whose ``params.name`` is missing or non-string also
-    yields ``None`` — we cannot name it, so we do not block it.
+    Capability inspects the **raw** payload — not the parsed message type — for
+    ``method == "tools/call"`` and a string ``params.name``. A tool name can
+    ride in on shapes that never validate as :class:`MCPRequest`: a
+    notification (no ``id``) or a request with a malformed ``id`` (a fractional
+    ``1.5``, an array, any non int|str|null value pydantic rejects). Trusting
+    the parse type there let those forms skip the allowlist entirely — the
+    bypass this closes. ``params.name`` carries the tool name regardless of the
+    ``id``, so we read it straight from the raw JSON.
+
+    Every other shape yields ``None`` and is left for the inspector / normal
+    forwarding: ``tools/list``, ``initialize``, any non-``tools/call`` method,
+    unparseable frames, and a ``tools/call`` whose ``params.name`` is missing
+    or non-string (we cannot name it, so we do not block it).
+
+    Whether an ``id`` key is present — captured in ``_CapHit.reply_expected`` —
+    decides only how a *block* answers the client, never whether it blocks: an
+    id-bearing call gets a ``-32603`` reply echoing that id; a notification
+    gets none but is still never forwarded.
     """
     hits: list[_CapHit | None] = []
     for member in members:
-        parsed, _ = parse_frame(member)
         hit: _CapHit | None = None
-        if isinstance(parsed, MCPRequest) and parsed.method == "tools/call":
-            params = parsed.params
+        try:
+            raw = json.loads(member)
+        except (json.JSONDecodeError, ValueError, RecursionError):
+            raw = None
+        if isinstance(raw, dict) and raw.get("method") == "tools/call":
+            params = raw.get("params")
             tool = params.get("name") if isinstance(params, dict) else None
             if isinstance(tool, str) and tool:
                 full_name = capability.namespaced(tool)
@@ -606,7 +641,8 @@ def _scan_capability(members: list[str], capability: CapabilityFilter) -> list[_
                 args = params.get("arguments") if isinstance(params, dict) else None
                 args_json = json.dumps(args, separators=(",", ":"), ensure_ascii=False, default=str)
                 hit = _CapHit(
-                    parsed=parsed,
+                    reply_id=raw.get("id"),
+                    reply_expected="id" in raw,
                     full_name=full_name,
                     args_truncated=args_json[:500],
                     blocked=not decision.allowed,
@@ -626,7 +662,13 @@ def _build_capability_batch(members: list[str], cap_hits: list[_CapHit | None]) 
     out: list[str] = []
     for member, hit in zip(members, cap_hits, strict=True):
         if hit is not None and hit.blocked:
-            out.append(_capability_error_reply(request_id=hit.parsed.id, full_name=hit.full_name))
+            # An id-bearing blocked call answers with the -32603 error; a
+            # blocked notification (no id) gets no reply — the batch is aborted
+            # and never forwarded, so it is simply dropped from the output.
+            if hit.reply_expected:
+                out.append(
+                    _capability_error_reply(request_id=hit.reply_id, full_name=hit.full_name)
+                )
             continue
         synth = _compose_batch_aborted_reply(member)
         if synth is not None:
@@ -634,7 +676,7 @@ def _build_capability_batch(members: list[str], cap_hits: list[_CapHit | None]) 
     return out
 
 
-def _capability_error_reply(*, request_id: JsonRpcId, full_name: str) -> str:
+def _capability_error_reply(*, request_id: Any, full_name: str) -> str:
     """JSON-RPC -32603 error telling the client the tool is not allowlisted
     and exactly how to allow it. The original call is never forwarded."""
     message = (
@@ -678,7 +720,7 @@ def _record_capability_block(
         session_id=session_id,
         direction="client_to_server",
         kind="request",
-        msg_id=None if hit.parsed.id is None else str(hit.parsed.id),
+        msg_id=None if hit.reply_id is None else str(hit.reply_id),
         method="tools/call",
         params_json=hit.args_truncated,
         raw=member,

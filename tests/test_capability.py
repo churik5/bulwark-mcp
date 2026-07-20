@@ -28,6 +28,7 @@ import yaml
 
 from bulwark_mcp.capability import CapabilityFilter, CapabilitySettings
 from bulwark_mcp.config import resolve_settings
+from bulwark_mcp.proxy import _scan_capability
 from bulwark_mcp.storage import Storage
 
 # ---------------------------------------------------------------------
@@ -75,6 +76,86 @@ class TestCapabilityCheck:
     def test_namespaced_without_server_name_is_bare(self) -> None:
         f = CapabilityFilter(CapabilitySettings(allowed_tools=("fs.read",)))
         assert f.namespaced("read") == "read"
+
+
+# ---------------------------------------------------------------------
+# Raw-payload extraction: _scan_capability (audit #10 / #13)
+# ---------------------------------------------------------------------
+
+
+class TestCapabilityRawPayloadExtraction:
+    """``_scan_capability`` inspects the RAW payload, not the parse type.
+
+    A ``tools/call`` carries its tool name in ``params.name`` regardless of the
+    ``id``. A fractional id (``1.5``) makes the frame fail :class:`MCPRequest`
+    validation, and a notification has no ``id`` at all — yet both are still
+    ``tools/call`` with a name, so both are subject to the allowlist. Before the
+    fix each yielded ``None`` (not blocked) and was forwarded to the server;
+    these tests pin the closed bypass and the reply metadata a block needs.
+    """
+
+    _CAP = CapabilityFilter(CapabilitySettings(allowed_tools=("srv.safe_tool",), server_name="srv"))
+
+    @staticmethod
+    def _member(**payload: object) -> str:
+        return json.dumps({"jsonrpc": "2.0", **payload}, separators=(",", ":"))
+
+    def test_fractional_id_tools_call_is_blocked(self) -> None:
+        # Audit #10: id=1.5 is not a valid MCPRequest id, but the call is still
+        # blocked and the raw id is preserved so the -32603 reply can echo it.
+        member = self._member(id=1.5, method="tools/call", params={"name": "danger"})
+        (hit,) = _scan_capability([member], self._CAP)
+        assert hit is not None
+        assert hit.blocked is True
+        assert hit.reply_expected is True  # id present → a block may reply
+        assert hit.reply_id == 1.5  # echoed back verbatim in the reply
+
+    def test_notification_tools_call_is_blocked(self) -> None:
+        # Audit #13: no id at all (notification), yet params.name is present.
+        member = self._member(method="tools/call", params={"name": "danger"})
+        (hit,) = _scan_capability([member], self._CAP)
+        assert hit is not None
+        assert hit.blocked is True
+        assert hit.reply_expected is False  # notification → no reply, still blocked
+        assert hit.reply_id is None
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param(
+                {"id": 1.5, "method": "tools/call", "params": {"name": "safe_tool"}},
+                id="fractional_id",
+            ),
+            pytest.param(
+                {"method": "tools/call", "params": {"name": "safe_tool"}},
+                id="notification",
+            ),
+        ],
+    )
+    def test_allowlisted_tool_passes_in_both_forms(self, payload: dict[str, object]) -> None:
+        # The fix must not start blocking allowlisted tools: an allowlisted name
+        # passes (blocked=False) whether its id is fractional or absent.
+        (hit,) = _scan_capability([self._member(**payload)], self._CAP)
+        assert hit is not None
+        assert hit.blocked is False
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            pytest.param({"id": 2, "method": "tools/list", "params": {}}, id="tools_list"),
+            pytest.param({"id": 3, "method": "initialize", "params": {}}, id="initialize"),
+            pytest.param({"id": 4, "method": "tools/call", "params": {}}, id="tools_call_no_name"),
+            pytest.param({"method": "notifications/initialized"}, id="unrelated_notification"),
+            pytest.param(
+                {"id": 5, "method": "tools/call", "params": {"name": 42}}, id="non_string_name"
+            ),
+        ],
+    )
+    def test_nameless_shapes_yield_none(self, payload: dict[str, object]) -> None:
+        # Unchanged behaviour: without a string params.name there is nothing to
+        # name, so the member is not subject to the allowlist (yields None).
+        (hit,) = _scan_capability([self._member(**payload)], self._CAP)
+        assert hit is None
 
 
 # ---------------------------------------------------------------------
@@ -320,3 +401,103 @@ async def test_empty_allowlist_emits_fail_open_warning(tmp_path: Path) -> None:
     assert rc == 0
     # Decision 2: never block silently when unconfigured — warn loudly.
     assert "capability filter inactive" in stderr.decode()
+
+
+async def test_fractional_id_call_is_blocked_end_to_end(tmp_path: Path) -> None:
+    """Audit #10: a fractional-id ``tools/call`` fails MCPRequest validation but
+    must still be blocked by capability — never forwarded — with the raw id
+    echoed back so the client can correlate the -32603 reply."""
+    db = tmp_path / "log.db"
+    cfg = tmp_path / "cfg.yaml"
+    _write_capability_config(cfg, allowed_tools=["testserver.safe_tool"])
+
+    frame = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1.5,
+            "method": "tools/call",
+            "params": {"name": "danger", "arguments": {"path": "/etc/passwd"}},
+        },
+        separators=(",", ":"),
+    )
+    rc, stdout, _stderr = await _run_proxy_subprocess(
+        db_path=db, config_path=cfg, server_cmd="cat", frames=[frame]
+    )
+    assert rc == 0
+
+    # Exactly one line — the -32603 reply. `cat` echoing the request would add
+    # a second line; its absence proves the frame was never forwarded.
+    out_lines = [line for line in stdout.decode().splitlines() if line.strip()]
+    assert len(out_lines) == 1
+    received = json.loads(out_lines[0])
+    assert received["id"] == 1.5  # raw fractional id echoed back verbatim
+    assert received["error"]["code"] == -32603
+    assert "testserver.danger" in received["error"]["message"]
+    assert "result" not in received
+
+    async with Storage(db) as storage:
+        rows = await storage.latest_events(limit=10)
+    cap_rows = [r for r in rows if (r["note"] or "").startswith("blocked_by_capability")]
+    assert len(cap_rows) == 1
+    assert "tool=testserver.danger" in cap_rows[0]["note"]
+
+
+async def test_notification_call_is_blocked_with_no_reply(tmp_path: Path) -> None:
+    """Audit #13: a notification (no id) carries the tool name in params.name.
+    It must be blocked — never forwarded — and, because JSON-RPC forbids
+    replying to a notification, generate no client reply at all."""
+    db = tmp_path / "log.db"
+    cfg = tmp_path / "cfg.yaml"
+    _write_capability_config(cfg, allowed_tools=["testserver.safe_tool"])
+
+    frame = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "method": "tools/call",  # no id → notification
+            "params": {"name": "danger", "arguments": {"path": "/etc/passwd"}},
+        },
+        separators=(",", ":"),
+    )
+    rc, stdout, _stderr = await _run_proxy_subprocess(
+        db_path=db, config_path=cfg, server_cmd="cat", frames=[frame]
+    )
+    assert rc == 0
+
+    # Zero output lines: no reply (notification) AND `cat` never echoed it
+    # (never forwarded). Together they prove a silent, non-forwarding block.
+    out_lines = [line for line in stdout.decode().splitlines() if line.strip()]
+    assert out_lines == []
+
+    # ...but it WAS blocked — the audit trail records it, with no msg_id.
+    async with Storage(db) as storage:
+        rows = await storage.latest_events(limit=10)
+    cap_rows = [r for r in rows if (r["note"] or "").startswith("blocked_by_capability")]
+    assert len(cap_rows) == 1
+    assert "tool=testserver.danger" in cap_rows[0]["note"]
+    assert cap_rows[0]["msg_id"] is None  # notification carried no id
+
+
+async def test_allowlisted_notification_is_forwarded(tmp_path: Path) -> None:
+    """Guard against over-blocking: an allowlisted tool invoked as a
+    notification passes capability and is forwarded verbatim (echoed by `cat`),
+    proving the raw-payload path did not start blocking allowlisted tools."""
+    db = tmp_path / "log.db"
+    cfg = tmp_path / "cfg.yaml"
+    _write_capability_config(cfg, allowed_tools=["testserver.safe_tool"])
+
+    frame = json.dumps(
+        {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "safe_tool"}},
+        separators=(",", ":"),
+    )
+    rc, stdout, _stderr = await _run_proxy_subprocess(
+        db_path=db, config_path=cfg, server_cmd="cat", frames=[frame]
+    )
+    assert rc == 0
+    out_lines = [line for line in stdout.decode().splitlines() if line.strip()]
+    assert len(out_lines) == 1
+    received = json.loads(out_lines[0])
+    assert received == json.loads(frame)  # untouched echo — forwarded, not blocked
+
+    async with Storage(db) as storage:
+        rows = await storage.latest_events(limit=10)
+    assert not [r for r in rows if (r["note"] or "").startswith("blocked_by_capability")]
