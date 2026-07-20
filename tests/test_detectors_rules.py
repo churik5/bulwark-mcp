@@ -571,6 +571,89 @@ class TestArgumentNormalisation:
         assert not result.is_hit
 
 
+class TestArgvShellDetectionLimits:
+    """Executable spec for a KNOWN, DELIBERATE limit of argv shell detection.
+
+    ``TestArgumentNormalisation`` shows the detector catching a dangerous
+    command passed as a direct array (``["rm","-rf","/"]``). This class pins
+    the flip side: a command *split across separate argument fields* — e.g.
+    ``{"cmd":"rm","args":["-rf","/"]}`` — is NOT caught, and by design.
+
+    Two audit findings are in direct tension and cannot both be closed by an
+    argv-regex detector:
+
+    - #9 wants the scalar ``"cmd":"rm"`` folded in so ``{cmd,args}`` reads as
+      ``rm -rf /`` and fires ``shell.rm_rf_root_or_home``.
+    - #14 warns that collecting scalar dict values (the naive #9 fix) makes
+      legitimately separate fields like ``{"keep":["rm"],"flags":["-rf","/"]}``
+      join into a phantom ``rm -rf /`` and falsely trip the rule.
+
+    #9 needs strings from different keys joined; #14 needs them left apart, so
+    ``_collect_array_strings`` is deliberately array-only and the separated
+    form stays unmatched. This is the same class of structural ceiling as
+    ``TestDisguisedInjectionGap``: matching a serialised, attacker-controlled
+    argument shape with regex can always be rephrased around. The reliable
+    control against an agent invoking a dangerous tool is the capability
+    allowlist, which blocks by tool NAME regardless of arguments.
+
+    These assertions PIN the current behaviour. If a future change to argv
+    collection flips them, that is a signal to re-examine the #9 ↔ #14
+    tradeoff — not an automatic win to merge.
+    """
+
+    @staticmethod
+    def _frame(arguments: object) -> str:
+        return json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "exec", "arguments": arguments},
+            },
+            separators=(",", ":"),
+        )
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            # The canonical #9 shape: the command verb sits in a scalar dict
+            # value ("cmd"), which the array-only collector drops, so the joined
+            # argument text is "-rf /" — no "rm", so the rule cannot match.
+            pytest.param({"cmd": "rm", "args": ["-rf", "/"]}, id="cmd_scalar_args_array"),
+            # Same evasion under different key names, with an extra flag.
+            pytest.param(
+                {"command": "rm", "flags": ["-rf", "--no-preserve-root", "/"]},
+                id="command_scalar_flags_array",
+            ),
+            # Verb in a scalar, the destructive tail in an array targeting home.
+            pytest.param({"bin": "rm", "argv": ["-rf", "~"]}, id="bin_scalar_argv_array"),
+        ],
+    )
+    def test_separated_command_form_is_unmatched(
+        self, builtin_engine: RulesEngine, arguments: object
+    ) -> None:
+        # DOCUMENTED LIMIT, not a bug to silently fix. The scalar command verb
+        # is dropped by the deliberately array-only collector, so the rule sees
+        # no "rm" and stays silent (score 0.0, no hit). Closing this naively —
+        # collecting scalar dict values — would reintroduce the cross-field
+        # false positive (#14). The real control here is the capability
+        # allowlist, which blocks by tool name regardless of argument shape.
+        result = builtin_engine.detect(self._frame(arguments), direction="client_to_server")
+        assert result.score == 0.0
+        assert not result.is_hit
+
+    def test_direct_array_form_is_still_caught(self, builtin_engine: RulesEngine) -> None:
+        # Contrast (and guard against over-reading the miss above): the
+        # equivalent single-array form IS caught, proving the detector works on
+        # the direct shape and it is specifically the separated {cmd,args} split
+        # that slips through.
+        result = builtin_engine.detect(
+            self._frame({"argv": ["rm", "-rf", "/"]}), direction="client_to_server"
+        )
+        assert "shell.rm_rf_root_or_home" in result.hits
+        assert result.score == 0.95
+
+
 class TestDeepNestingDoesNotCrash:
     """Regression: a pathologically nested c2s frame must not crash the detector.
 

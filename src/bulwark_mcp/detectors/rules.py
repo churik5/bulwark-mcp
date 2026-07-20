@@ -301,6 +301,16 @@ def _collect_array_strings(node: Any, chunks: list[str]) -> None:
 
     Dicts are recursed into (never coerced to strings); non-string scalars
     inside arrays are ignored; arrays of dicts are recursed element-wise.
+
+    Deliberately array-only: scalar dict values are NOT collected. Folding them
+    in would let a command split across fields (``{"cmd":"rm","args":["-rf",
+    "/"]}``) reassemble and fire the shell rules (audit #9) — but it would
+    equally join legitimately separate fields (``{"keep":["rm"],"flags":
+    ["-rf","/"]}``) into a phantom ``rm -rf /`` and raise a false positive
+    (audit #14). Argv-regex cannot reconcile the two, so this stays array-only;
+    the reliable control against dangerous tool calls is the capability
+    allowlist (blocks by tool name, not argument content). The limit is pinned
+    by ``tests/test_detectors_rules.py::TestArgvShellDetectionLimits``.
     """
     if isinstance(node, dict):
         for value in node.values():
