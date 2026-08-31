@@ -43,42 +43,17 @@ Architecture lives in the six ADRs under [`docs/adr/`](docs/adr/). The short ver
     └──────────────┘                  └──────────────┘
 ```
 
-## Features
+## What it does
 
-**Week 1 (audit-only):**
+**Proxy & audit.** A drop-in stdio proxy: your MCP client talks to `bulwark-mcp`, which talks to the real server — no protocol changes. Every JSON-RPC frame in both directions is logged to SQLite (WAL, batched, crash-safe), viewable live with `bulwark logs --tail`/`--follow`. Oversized frames are forwarded byte-for-byte and logged as `raw`; malformed JSON is logged as `parse_error` without dropping the traffic after it. The audit log works on its own, with detection off.
 
-- 🔌 **Drop-in proxy** — your MCP client talks to `bulwark-mcp`; `bulwark-mcp` talks to the real server. No protocol changes.
-- 📝 **Append-only audit log** — every JSON-RPC frame in both directions, persisted to SQLite (WAL mode, batched writes).
-- 🧱 **Crash-safe** — `synchronous=NORMAL` + WAL keeps logs durable across crashes; queue-based writer keeps the data path lock-free.
-- 🛡️ **Safe argv handling** — the underlying server is launched with `subprocess_exec` (no shell), so a crafted `--server` string can't shell-inject.
-- 📜 **Rich viewer** — `bulwark logs --tail` and `--follow` give a colourised table with direction arrows, kind highlighting, and JSON-collapsed payloads.
-- 🚫 **Never corrupts the protocol** — frames over the line limit are forwarded byte-for-byte and logged as `raw`; malformed JSON is logged as `parse_error` without dropping subsequent traffic.
+**Detection (opt-in).** Turn on `--detector` and every tool result heading to the agent is scanned. A three-pass regex layer (28+ signatures from [garak](https://github.com/leondz/garak), [promptfoo](https://github.com/promptfoo/promptfoo), [Trojan Source](https://trojansource.codes/), [embracethered](https://embracethered.com/); NFKC + invisible-char folding + cross-script homoglyph handling) runs first, then an optional local LLM classifier ([Ollama](https://ollama.com), `qwen2.5:3b` by default). On a block, the agent gets a structured `isError: true` reply with a trace id — never the attacker's payload; the original bytes stay in the audit log for forensics. Rules <5 ms p95, classifier ≤200 ms p95 cached, hard 250 ms abort. Ollama is optional: three failed calls opens a circuit breaker for 60 s and the proxy falls back to rules-only without dropping a frame.
 
-**Week 2 (detection layer, opt-in):**
+**Access control.** A name-based [capability allowlist](#capability-filter) that runs *in front of* the detector: it blocks by tool *name*, regardless of arguments. Where content rules catch a malicious payload, capability catches the fact that a dangerous tool was invoked at all. Fail-open by default with a loud warning until you configure it.
 
-- 🧯 **Rules-based detector** — 24+ regex signatures shipped as YAML packs, sourced from [garak](https://github.com/leondz/garak), [promptfoo](https://github.com/promptfoo/promptfoo), [Trojan Source](https://trojansource.codes/), and [embracethered](https://embracethered.com/). See [`docs/THREATS.md`](docs/THREATS.md).
-- 🤖 **Local LLM classifier** — talks to a [Ollama](https://ollama.com) instance running [`qwen2.5:3b`](https://ollama.com/library/qwen2.5) by default, with a SHA-256 cache and circuit breaker so a stalled model can never block the pump for more than 1 s.
-- 🪪 **Sanitised replacement on block** — when the detector blocks a tool result, the agent receives a structured JSON-RPC response with `isError: true` and a trace id; the original bytes stay in the audit log for forensics.
-- 🛟 **Graceful degradation** — Ollama is **optional**. If it is down or hits the timeout 3× in a row, the circuit breaker opens for 60 s and the proxy falls back to rules-only without dropping traffic.
-- 📜 **YAML policy engine** — `policies.yaml` decides allow/warn/block from `(direction, method, classifier, score, rules_hit)`. The default policy is conservative — see [`docs/RUNBOOK.md`](docs/RUNBOOK.md) for paranoid mode.
-- ⚡ **Bounded latency** — rules <5 ms p95, classifier ≤200 ms p95 with cache, hard inspector abort at 250 ms (frame is forwarded with `det_verdict=WARN`). Numbers in [`docs/PERF.md`](docs/PERF.md).
+**Policy & ops.** A YAML policy engine decides allow/warn/block from `(direction, method, classifier, score, rules_hit)`. Everything is local and self-hosted — no telemetry unless you opt in, and even then it's anonymous counts only (no rule names, no traffic content). Operational tooling: `bulwark doctor` (environment diagnostic), `bulwark stats` (local audit summary), `bulwark benchmark` (latency on your own hardware), `bulwark rules lint` (validate community rule packs), and a loopback `/health` endpoint for container setups.
 
-**Week 3 (community readiness + observability):**
-
-- 🛡️ **Audit-finding fixes (5 from Week-2 self-audit):** NFKC + invisible-char three-pass scan, per-member inspection of JSON-RPC batch frames, explicit `skipped:non_text_content` audit note, one-end truncation closes the seam evasion path.
-- 🧪 **`bulwark rules lint [--strict]`** — validate community-contributed YAML packs. Strict mode is the gate for promotion to the built-in pack (see [`CONTRIBUTING.md`](CONTRIBUTING.md)).
-- 📊 **`bulwark stats`** — local-only summary of the audit log: verdict counts, top-5 rules, latency p50/p95. Rich table by default, versioned JSON via `--json` for scripting.
-- 💓 **Health endpoint** — `bulwark run --health-port N` binds a loopback `GET /health` listener (k8s/docker-friendly).
-- 📡 **Opt-in anonymous telemetry** — `BULWARK_TELEMETRY=true` enables a daily payload of version + OS + event counts. **No rule names, no traffic content, no fingerprinting.** Full schema and what we explicitly DON'T send: [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md).
-- 🔌 **Tested MCP integrations** — `github`, `brave-search`, `postgres`. See [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md). Add yours per the per-server template.
-
-**Week 4 (launch readiness):**
-
-- 🩺 **`bulwark doctor`** — environment diagnostic with four checks (Python version, Ollama reachable + model loaded, audit DB writable at schema v2, rules + policy validate). Exit code reflects worst status.
-- ⏱️ **`bulwark benchmark`** — three workloads (rules detector, inspector cache hit, end-to-end) with p50/p95/p99 output. Run it on your own hardware to compare against the numbers in `docs/PERFORMANCE.md`.
-- 📦 **PyPI distribution** — `pipx install bulwark-mcp` works. CI publishes on tag via OIDC trusted publishing (no token in repo).
-- 🛡️ **Hardening (6 audit findings closed)** — ReDoS guard for community regex, batch JSON-RPC per-id reply synthesis, slowloris protection on `/health`, stats JSON size cap, snapshot caching, cross-script homoglyph fold (Cyrillic/Greek confusables).
-- 🤖 **Launch automation** — 7 GitHub Actions workflows (publish, test-publish, release notes, label sync, auto-label, welcome bot, stale closer), each with opt-out via `vars.BULWARK_MCP_DISABLE_<NAME>`.
+Everything is **off by default** until you opt in. Full architecture is in the ADRs under [`docs/adr/`](docs/adr/); the threat catalogue with sources is in [`docs/THREATS.md`](docs/THREATS.md).
 
 ## Quick start
 
@@ -110,7 +85,7 @@ bulwark logs --tail 5
 
 The first command prints a four-line table. The second pipes one frame through the proxy with `cat` as a stand-in MCP server; you should see the same frame echo back. The third shows the audit log row.
 
-## Detection (Week 2)
+## Detection
 
 The detector is **opt-in**. Enable it with `--detector` on the CLI or `detector.enabled: true` in config. With the detector on, every frame is inspected against a regex rule pack, and tool results going *to* the agent additionally get classified by a local LLM (Ollama by default). When a high-confidence injection is detected, the proxy substitutes the agent-bound bytes with a sanitised replacement — the model receives a structured `isError: true` response, never the attacker's payload. The original bytes stay in `events.raw` for forensics.
 
@@ -239,16 +214,15 @@ The test suite spawns a real `python -m bulwark_mcp run --server "cat"` subproce
 
 Architecture decisions land as ADRs in `docs/adr/`. Six ADRs ship with v0.4.2:
 
-- ADR-0001..0003: stdio proxy, async SQLite writer, audit log schema (Week 1).
-- ADR-0004: detection layer architecture — rules + LLM cascade (Week 2).
-- ADR-0005: observability layer + opt-in telemetry privacy (Week 3).
+- ADR-0001..0003: stdio proxy, async SQLite writer, audit log schema.
+- ADR-0004: detection layer architecture — rules + LLM cascade.
+- ADR-0005: observability layer + opt-in telemetry privacy.
 - ADR-0006: project rename mcp-firewall → bulwark-mcp (pre-launch name conflict).
 
 Next milestones:
 
 - ADR-0007: HTTP/SSE transport.
 - ADR-0008: async-parallel inspection + Anthropic Haiku fallback tier.
-- ADR-0009: Pro tier — hosted log shipping & threat-feed sync.
 
 ## FAQ
 
@@ -278,19 +252,6 @@ Three things distinguish bulwark-mcp:
 1. **Local-first.** No data leaves your machine — the LLM classifier talks to a local Ollama instance, telemetry is opt-in and aggregated. SaaS competitors require sending tool outputs to their cloud, which defeats the point if those outputs contain credentials.
 2. **MCP-specific threat model.** Other tools treat prompt injection as a generic LLM input problem. bulwark-mcp inspects JSON-RPC frames, knows the difference between `tools/call` and `tools/list`, and replaces blocked tool results with structured `isError: true` responses the agent will actually parse.
 3. **Different from `mcp-firewall` (Robert Ressl's).** Same niche, different shape. Robert's project focuses on OPA/Rego policies, RBAC, and compliance reporting (DORA, FINMA, SOC 2). bulwark-mcp focuses on detecting indirect prompt injection in tool results with regex + local LLM classifier. Both are AGPL; pick the one that matches your threat model.
-
-## Roadmap
-
-| Milestone   | Status | Scope                                                                       |
-|-------------|--------|-----------------------------------------------------------------------------|
-| Week 1      | ✅     | stdio proxy + audit log + CLI viewer                                        |
-| Week 2      | ✅     | Rules + LLM detector, YAML policy engine, sanitised replacements            |
-| Week 3      | ✅     | Community readiness, integration tests, observability, audit hardening      |
-| Week 4      | ✅     | Launch readiness — PyPI publishing, `doctor`, `benchmark`, 7 CI workflows   |
-| Week 5      | 🚧     | Public OSS launch (HN / Reddit / X) — you're looking at this week           |
-| Week 6-7    | ⏳     | Community rules repo, HTTP/SSE transport, viewer filters                    |
-| Week 8-10   | ⏳     | Pro tier: hosted logs, threat feed, Slack/Discord/Telegram alerts           |
-| Week 11-13  | ⏳     | First paying users — pricing & monetisation                                 |
 
 ## Capability filter
 
