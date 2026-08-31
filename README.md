@@ -47,7 +47,7 @@ Architecture lives in the six ADRs under [`docs/adr/`](docs/adr/). The short ver
 
 **Proxy & audit.** A drop-in stdio proxy: your MCP client talks to `bulwark-mcp`, which talks to the real server — no protocol changes. Every JSON-RPC frame in both directions is logged to SQLite (WAL, batched, crash-safe), viewable live with `bulwark logs --tail`/`--follow`. Oversized frames are forwarded byte-for-byte and logged as `raw`; malformed JSON is logged as `parse_error` without dropping the traffic after it. The audit log works on its own, with detection off.
 
-**Detection (opt-in).** Turn on `--detector` and every tool result heading to the agent is scanned. A three-pass regex layer (28+ signatures from [garak](https://github.com/leondz/garak), [promptfoo](https://github.com/promptfoo/promptfoo), [Trojan Source](https://trojansource.codes/), [embracethered](https://embracethered.com/); NFKC + invisible-char folding + cross-script homoglyph handling) runs first, then an optional local LLM classifier ([Ollama](https://ollama.com), `qwen2.5:3b` by default). On a block, the agent gets a structured `isError: true` reply with a trace id — never the attacker's payload; the original bytes stay in the audit log for forensics. Rules <5 ms p95, classifier ≤200 ms p95 cached, hard 250 ms abort. Ollama is optional: three failed calls opens a circuit breaker for 60 s and the proxy falls back to rules-only without dropping a frame.
+**Detection (opt-in).** Turn on `--detector` and every tool result heading to the agent is scanned. A three-pass regex layer (25 signatures from [garak](https://github.com/leondz/garak), [promptfoo](https://github.com/promptfoo/promptfoo), [Trojan Source](https://trojansource.codes/), [embracethered](https://embracethered.com/); NFKC + invisible-char folding + cross-script homoglyph handling) runs first, then an optional local LLM classifier ([Ollama](https://ollama.com), `qwen2.5:3b` by default). On a block, the agent gets a structured `isError: true` reply with a trace id — never the attacker's payload; the original bytes stay in the audit log for forensics. Rules <5 ms p95, classifier ≤200 ms p95 cached, hard 250 ms abort. Ollama is optional: three failed calls opens a circuit breaker for 60 s and the proxy falls back to rules-only without dropping a frame.
 
 **Access control.** A name-based [capability allowlist](#capability-filter) that runs *in front of* the detector: it blocks by tool *name*, regardless of arguments. Where content rules catch a malicious payload, capability catches the fact that a dangerous tool was invoked at all. Fail-open by default with a loud warning until you configure it.
 
@@ -182,8 +182,8 @@ bulwark-mcp/
 │   │   ├── base.py            # shared dataclasses (RulesResult, ClassifierResult, …)
 │   │   ├── llm.py             # Ollama client + cache + circuit breaker
 │   │   └── rules.py           # YAML rule-pack loader + regex evaluator
-│   └── rules/builtin/         # shipped rule packs (≥24 rules)
-├── tests/                     # pytest, 221 cases as of v0.4.2
+│   └── rules/builtin/         # shipped rule packs (25 rules)
+├── tests/                     # pytest, 325 cases
 ├── docs/
 │   ├── adr/0001-…0004.md      # architecture decision records
 │   ├── PERF.md                # latency budget + measured numbers
