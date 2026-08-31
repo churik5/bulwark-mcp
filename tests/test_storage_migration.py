@@ -16,6 +16,8 @@ exercised here because they live or die with the migration.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -283,3 +285,117 @@ class TestInsertWithVerdict:
         assert len(passed) == 1
         assert blocked[0]["det_verdict"] == "BLOCK"
         assert passed[0]["det_verdict"] == "PASS"
+
+
+class TestFailedMigrationDoesNotLeakConnection:
+    """``open()`` must not strand the connection it just opened.
+
+    ``Storage`` is documented "always open with ``async with``", and
+    ``async with`` only calls ``__aexit__`` when ``__aenter__`` succeeded.
+    So a migration that raises out of ``open()`` means ``close()`` never
+    runs: without the guard in ``open()`` the connection stays live in
+    ``_conn`` (its worker thread outliving the loop), and the early-return
+    guard would later hand that dead handle back to the next ``open()``.
+    """
+
+    @staticmethod
+    def _failing_migration(
+        storage: Storage, exc: BaseException, captured: list[aiosqlite.Connection]
+    ) -> Callable[[], Awaitable[None]]:
+        """A ``_run_migrations`` stand-in that records the live conn, then raises."""
+
+        async def _run() -> None:
+            captured.append(storage._required_conn)
+            raise exc
+
+        return _run
+
+    @staticmethod
+    async def _drain(storage: Storage, captured: list[aiosqlite.Connection]) -> None:
+        """Close whatever the code under test left open.
+
+        A no-op on the passing path — both closes are idempotent — but on a
+        regression it stops the leaked aiosqlite worker thread. That thread is
+        non-daemon, so without this the assertions below would report the
+        failure and then hang the interpreter at exit instead of exiting
+        non-zero; a regression must fail red, not time out.
+        """
+        await storage.close()
+        for conn in captured:
+            await conn.close()
+
+    async def test_failed_migration_closes_connection_and_clears_conn(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = Storage(tmp_path / "log.db")
+        captured: list[aiosqlite.Connection] = []
+        monkeypatch.setattr(
+            storage,
+            "_run_migrations",
+            self._failing_migration(storage, RuntimeError("migration exploded"), captured),
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="migration exploded"):
+                async with storage:
+                    pass  # pragma: no cover - __aenter__ raises first
+
+            assert storage._conn is None
+            # The connection opened by open() was really closed, not just dropped.
+            assert len(captured) == 1
+            with pytest.raises(ValueError, match=r"(?i)connection"):
+                await captured[0].execute("SELECT 1")
+        finally:
+            await self._drain(storage, captured)
+
+    async def test_reopen_after_crashed_migration_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db = tmp_path / "log.db"
+        storage = Storage(db)
+        captured: list[aiosqlite.Connection] = []
+        monkeypatch.setattr(
+            storage,
+            "_run_migrations",
+            self._failing_migration(storage, RuntimeError("migration exploded"), captured),
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="migration exploded"):
+                await storage.open()
+            assert storage._conn is None
+
+            # Same instance, real migrations this time: the early-return guard
+            # must not strand it on the connection the crashed open() left behind.
+            monkeypatch.undo()
+            await storage.open()
+            assert storage._conn is not None
+            assert storage._conn is not captured[0]
+            assert await _max_version(storage) == 2
+            sid = await storage.start_session(server_command="cat")
+            assert sid >= 1
+        finally:
+            await self._drain(storage, captured)
+
+    async def test_cancelled_migration_closes_connection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        storage = Storage(tmp_path / "log.db")
+        captured: list[aiosqlite.Connection] = []
+        monkeypatch.setattr(
+            storage,
+            "_run_migrations",
+            self._failing_migration(storage, asyncio.CancelledError(), captured),
+        )
+
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                async with storage:
+                    pass  # pragma: no cover - __aenter__ raises first
+
+            assert storage._conn is None
+            assert len(captured) == 1
+            with pytest.raises(ValueError, match=r"(?i)connection"):
+                await captured[0].execute("SELECT 1")
+        finally:
+            await self._drain(storage, captured)

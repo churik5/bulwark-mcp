@@ -146,7 +146,23 @@ class Storage:
         await conn.execute("INSERT OR IGNORE INTO schema_version(version) VALUES (1)")
         await conn.commit()
         self._conn = conn
-        await self._run_migrations()
+        try:
+            await self._run_migrations()
+        except BaseException:
+            # A failed — or cancelled — migration must not leak the connection
+            # we just opened: ``open()`` raises out of ``__aenter__``, so
+            # ``async with`` never calls ``__aexit__`` and ``close()`` would
+            # never run. Clearing ``_conn`` also means a later ``open()`` on
+            # this instance really re-opens instead of returning early on a
+            # dead handle; migrations are written to be safe to retry. The
+            # ``finally`` guarantees ``_conn`` is cleared even if ``close()``
+            # is itself interrupted by a second ``CancelledError`` during a
+            # real cancellation.
+            try:
+                await conn.close()
+            finally:
+                self._conn = None
+            raise
 
     async def _current_schema_version(self) -> int:
         conn = self._required_conn
