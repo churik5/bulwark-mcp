@@ -21,6 +21,7 @@ from rich.text import Text
 from . import __version__
 from .benchmark import BenchResult, run_benchmarks_sync
 from .config import Settings, resolve_settings
+from .config_validate import Finding, error_count, validate_config, warning_count
 from .detectors.llm import OllamaClassifier
 from .detectors.rules import RulesEngine
 from .doctor import CheckResult, doctor_sync
@@ -713,6 +714,67 @@ def _print_doctor_table(results: list[CheckResult], overall: str) -> None:
             out.print(f"  [bold]→[/bold] [dim]{r.name}:[/dim] {r.suggestion}")
     out.print()
     out.print(f"overall: [{style[overall]}]{overall.upper()}[/{style[overall]}]")
+
+
+@main.command("config-validate")
+@click.argument("path", type=click.Path(path_type=Path))
+def cmd_config_validate(path: Path) -> None:
+    """Validate a YAML config file without starting the proxy.
+
+    Checks the file at PATH and only that file — BULWARK_CONFIG and
+    BULWARK_DB are ignored for the duration, so the verdict describes the
+    file you named. Every finding is collected; the command does not stop
+    at the first problem.
+
+    Catches what the loader shrugs off: a section that is not a mapping
+    (``detector: yes``) makes the runtime fall back to defaults in silence,
+    and an unknown top-level key (``detctor:``) is ignored outright.
+
+    Exit 0 = no errors (warnings are allowed), 1 = at least one error.
+    """
+    findings = validate_config(path)
+    _print_config_validate_table(findings)
+    sys.exit(1 if error_count(findings) else 0)
+
+
+_FINDING_STYLE = {"pass": "green", "warn": "yellow", "fail": "bold red", "skip": "dim"}
+
+
+def _print_config_validate_table(findings: list[Finding]) -> None:
+    out = Console()
+    table = Table(show_lines=False, expand=True)
+    table.add_column("check", no_wrap=True)
+    table.add_column("status", justify="center", no_wrap=True)
+    table.add_column("detail")
+    for f in findings:
+        # Details quote the user's own YAML, so they go in as Text — a value
+        # like `[1, 2]` must not be read as Rich markup.
+        table.add_row(
+            f.name,
+            Text(f.status.upper(), style=_FINDING_STYLE[f.status]),
+            Text(f.detail),
+        )
+    out.print(table)
+    for f in findings:
+        if f.suggestion and f.status in ("warn", "fail"):
+            out.print(Text.assemble(("  → ", "bold"), (f"{f.name}: ", "dim"), f.suggestion))
+    out.print()
+    out.print(_overall_line(error_count(findings), warning_count(findings)))
+
+
+def _overall_line(errors: int, warnings: int) -> Text:
+    if errors:
+        body = f"FAIL ({_plural(errors, 'error')}"
+        body += f", {_plural(warnings, 'warning')})" if warnings else ")"
+        style = "bold red"
+    else:
+        body = f"PASS ({_plural(warnings, 'warning')})" if warnings else "PASS"
+        style = "yellow" if warnings else "green"
+    return Text.assemble("overall: ", (body, style))
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" if count == 1 else f"{count} {noun}s"
 
 
 @main.group("rules")

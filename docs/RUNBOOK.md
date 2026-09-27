@@ -226,6 +226,48 @@ Rules live as YAML under `src/bulwark_mcp/rules/builtin/`. Set
 want, or override one rule by setting `apply_to: []` in your override pack —
 that loads but never fires.
 
+## Config authoring
+
+Config files are hand-edited and the loader is forgiving, which is a bad
+combination: `resolve_settings()` replaces a section that is not a mapping
+with `{}` and ignores unknown top-level keys, both without a word. Write
+`detector: yes` instead of a `detector:` block and the proxy starts with the
+firewall **off** while the file says it is on. Run the validator after every
+hand edit:
+
+```bash
+bulwark config-validate ./config.yaml
+```
+
+It checks the file you name and only that file — `BULWARK_CONFIG` and
+`BULWARK_DB` are ignored for the run — and reports every finding rather than
+stopping at the first:
+
+| # | Check | Fails on |
+|---|-------|----------|
+| 1 | Config file | missing, unreadable, or not UTF-8 |
+| 2 | YAML syntax | a parse error, or a top level that is not a mapping |
+| 3 | Top-level keys | never fails — an unknown key (`detctor:`) is a WARN with the closest real section suggested |
+| 4 | Section types | `storage`, `detector`, `capability` or `detector.llm` present but not a mapping |
+| 5 | Field types | a numeric field the loader would reject, truncate, or coerce (`timeout_ms: "1s"`, `1.9`, `true`) |
+| 6 | Config loader | whatever `resolve_settings()` itself raises — capability allowlist shape, unparseable values |
+| 7 | Policy file | `detector.policies_file` set but missing or malformed |
+| 8 | Rule packs | the configured `rules_dir` does not load; on success reports the real rule and pack counts |
+
+A check that makes the ones after it impossible marks them `SKIP`; a skip is
+neither an error nor a warning.
+
+Exit codes: **0** when there are no errors (warnings are fine — `PASS (1
+warning)`), **1** when there is at least one error. Unlike `bulwark doctor`,
+warnings never change the exit code, so this is safe to gate a deploy on.
+
+Two WARNs are worth knowing about because they are not typos:
+
+- `logging:` is documented in `config.example.yaml` but the loader has never
+  read it. Anything under it has no effect.
+- An empty config file is valid; every setting falls back to its built-in
+  default.
+
 ## Rotation
 
 The log is append-only and grows roughly proportional to traffic (~1 KB per tool call). For a personal workstation that's a few MB per month — not enough to bother rotating in v0.
