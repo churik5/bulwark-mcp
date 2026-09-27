@@ -51,7 +51,7 @@ Architecture lives in the six ADRs under [`docs/adr/`](docs/adr/). The short ver
 
 **Access control.** A name-based [capability allowlist](#capability-filter) that runs *in front of* the detector: it blocks by tool *name*, regardless of arguments. Where content rules catch a malicious payload, capability catches the fact that a dangerous tool was invoked at all. Fail-open by default with a loud warning until you configure it.
 
-**Policy & ops.** A YAML policy engine decides allow/warn/block from `(direction, method, classifier, score, rules_hit)`. Everything is local and self-hosted — no telemetry unless you opt in, and even then it's anonymous counts only (no rule names, no traffic content). Operational tooling: `bulwark doctor` (environment diagnostic), `bulwark stats` (local audit summary), `bulwark benchmark` (latency on your own hardware), `bulwark rules lint` (validate community rule packs), and a loopback `/health` endpoint for container setups.
+**Policy & ops.** A YAML policy engine decides allow/warn/block from `(direction, method, classifier, score, rules_hit)`. Everything is local and self-hosted — no telemetry unless you opt in, and even then it's anonymous counts only (no rule names, no traffic content). Operational tooling: `bulwark doctor` (environment diagnostic), `bulwark stats` (local audit summary), `bulwark benchmark` (latency on your own hardware), `bulwark rules lint` (validate community rule packs), `bulwark config-validate` (check a config file before running), and a loopback `/health` endpoint for container setups.
 
 Everything is **off by default** until you opt in. Full architecture is in the ADRs under [`docs/adr/`](docs/adr/); the threat catalogue with sources is in [`docs/THREATS.md`](docs/THREATS.md).
 

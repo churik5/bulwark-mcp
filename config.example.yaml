@@ -18,15 +18,6 @@ storage:
   batch_size: 100
   batch_interval_ms: 50
 
-# --- Logging --------------------------------------------------------------
-logging:
-  # Where bulwark-mcp's OWN diagnostics go (NOT the audit log).
-  # stderr | <path>
-  # We never log to stdout because that channel is reserved for JSON-RPC frames
-  # going back to the client.
-  destination: "stderr"
-  level: "INFO"  # DEBUG | INFO | WARNING | ERROR
-
 # --- Detector (Week 2) ----------------------------------------------------
 # Off by default — Week 1 users keep their latency profile until they opt
 # in. Once enabled, every JSON-RPC frame goes through the cascade in

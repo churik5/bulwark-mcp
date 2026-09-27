@@ -58,7 +58,7 @@ FindingStatus = Literal["pass", "warn", "fail", "skip"]
 # re-derives this set from the loader's source.
 KNOWN_SECTIONS: tuple[str, ...] = ("storage", "detector", "capability")
 
-# Documented in config.example.yaml but never read by the loader. Worth a
+# Section names the loader never reads (may linger in older configs). Worth a
 # WARN of its own: the values look live and are not.
 INERT_SECTIONS: tuple[str, ...] = ("logging",)
 
@@ -309,10 +309,7 @@ def _check_top_level_keys(data: dict[str, Any]) -> list[Finding]:
                 Finding(
                     name=_CHECK_KEYS,
                     status="warn",
-                    detail=(
-                        f"'{key}' is documented in config.example.yaml but the loader "
-                        f"never reads it — anything under it has no effect"
-                    ),
+                    detail=(f"'{key}' is not read by the loader — anything under it has no effect"),
                 )
             )
             continue

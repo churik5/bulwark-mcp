@@ -30,6 +30,7 @@ the same words inside a user request is usually legitimate intent.
 | `role_hijack.act_as_jailbreak` | "act as DAN / AIM / STAN / unrestricted" jailbreak prefix | [jailbreakchat.com](https://www.jailbreakchat.com/) | 0.9 | Very low. |
 | `role_hijack.fake_system_tag` | `<\|system\|>`, `<\|im_start\|>`, `<\|admin\|>` etc. — synthetic system tags | [garak probes](https://github.com/leondz/garak/tree/main/garak/probes) | 0.8 | Low — these tags should not appear in tool results. |
 | `role_hijack.from_now_on` | "from now on, you will / must / shall …" | [Simon Willison's prompt-injection tag](https://simonwillison.net/tags/prompt-injection/) | 0.7 | Medium — common in tutorials; score reflects ambiguity. |
+| `role_hijack.bracketed_role_marker` | square-bracket markers imitating chat template boundaries — `[SYSTEM]:`, `[INST]`, `[NOTE TO AI ASSISTANT:`, `[END USER MESSAGE]` | [Cato CTRL Atlassian PoC, June 2025](https://www.catonetworks.com/blog/cato-ctrl-poc-attack-targeting-atlassians-mcp/) | 0.85 | Low — these markers should not appear in tool results, though `[INST]` can show up in text discussing prompt formats. |
 
 ## Class: data exfiltration
 
